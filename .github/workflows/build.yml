@@ -8,6 +8,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Unzip project
+        run: unzip -q DepthWall.zip
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -16,12 +18,15 @@ jobs:
         with:
           gradle-version: '8.7'
       - name: Download depth model
+        working-directory: DepthWall
         run: |
           mkdir -p app/src/main/assets
           curl -fL --retry 3 -o app/src/main/assets/depth.onnx \
             https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx
-      - run: gradle assembleDebug --no-daemon
+      - name: Build
+        working-directory: DepthWall
+        run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: DepthWall-debug
-          path: app/build/outputs/apk/debug/*.apk
+          path: DepthWall/app/build/outputs/apk/debug/*.apk

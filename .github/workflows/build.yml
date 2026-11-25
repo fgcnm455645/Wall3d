@@ -1,32 +1,258 @@
 name: Build APK
+
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
+  push:
+    branches: [main]
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unzip project
-        run: unzip -q DepthWall.zip
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
-      - uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.7'
+          java-version: 17
+
+      - name: Install SDK 35
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
       - name: Download depth model
-        working-directory: DepthWall
         run: |
           mkdir -p app/src/main/assets
-          curl -fL --retry 3 -o app/src/main/assets/depth.onnx \
-            https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx
-      - name: Build
-        working-directory: DepthWall
-        run: gradle assembleDebug --no-daemon
+          F=app/src/main/assets/depthanythingv2-vits-dynamic-quant.onnx
+          rm -f $F
+          for U in \
+            "https://raw.githubusercontent.com/combatwombat/tiefling/main/site/public/models/depthanythingv2-vits-dynamic-quant.onnx" \
+            "https://media.githubusercontent.com/media/combatwombat/tiefling/main/site/public/models/depthanythingv2-vits-dynamic-quant.onnx" \
+            "https://github.com/combatwombat/tiefling/raw/main/site/public/models/depthanythingv2-vits-dynamic-quant.onnx"; do
+            echo "Trying $U"
+            curl -L --fail --retry 3 -o $F "$U" || continue
+            S=$(stat -c%s $F)
+            echo "size=$S"
+            if [ "$S" -gt 10000000 ]; then break; fi
+            rm -f $F
+          done
+          ls -l app/src/main/assets/
+          if [ ! -f $F ] || [ "$(stat -c%s $F)" -lt 10000000 ]; then
+            echo "MODEL DOWNLOAD FAILED"
+            exit 1
+          fi
+
+      - name: Check model exists
+        run: ls -lh app/src/main/assets/
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Add launcher icons
+        run: |
+          R=app/src/main/res
+          mkdir -p $R/drawable $R/values $R/mipmap-anydpi-v26
+          cat > $R/values/ic_launcher_bg.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_bg">#14142B</color>
+          </resources>
+          EOF
+          cat > $R/drawable/ic_launcher_fg.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#3D3D8F" android:pathData="M18,76 L46,40 L64,62 L74,50 L90,76 Z"/>
+              <path android:fillColor="#7C7CFF" android:pathData="M28,82 L52,52 L68,72 L76,62 L88,82 Z"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M72,30 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0"/>
+          </vector>
+          EOF
+          for n in ic_launcher ic_launcher_round; do
+          cat > $R/mipmap-anydpi-v26/$n.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_bg"/>
+              <foreground android:drawable="@drawable/ic_launcher_fg"/>
+          </adaptive-icon>
+          EOF
+          done
+
+      - name: Fix theme name
+        run: |
+          grep -rn "Theme.Material.NoTitleBar" app/src || true
+          grep -rl "Theme.Material.NoTitleBar" app/src | xargs -r sed -i 's/Theme\.Material\.NoTitleBar/Theme.Material.NoActionBar/g'
+
+      - name: Fix parallax rendering
+        run: |
+          cat > $HOME/patch_parallax.py << 'EOF'
+          import re, sys
+
+          base = "app/src/main/java/com/example/parallaxwallpaper/"
+
+          def patch(path, edits):
+              s = open(path).read()
+              for old, new in edits:
+                  if old not in s:
+                      print("PATTERN NOT FOUND in " + path + ":\n" + old)
+                      sys.exit(1)
+                  s = s.replace(old, new, 1)
+              open(path, "w").write(s)
+
+          # ---------- ParallaxEngine.kt ----------
+          p = base + "wallpaper/ParallaxEngine.kt"
+          s = open(p).read()
+
+          # 1) new fragment shader
+          start = s.index('private val FRAGMENT_SHADER = """')
+          end = s.index('""".trimIndent()', start) + len('""".trimIndent()')
+          new_fs = '''private val FRAGMENT_SHADER = """
+                      #ifdef GL_FRAGMENT_PRECISION_HIGH
+                      precision highp float;
+                      #else
+                      precision mediump float;
+                      #endif
+                      uniform sampler2D uImageTexture;
+                      uniform sampler2D uDepthTexture;
+                      uniform vec2      uParallaxOffset;
+                      uniform float     uParallaxStrength;
+                      uniform vec2      uUvScale;
+                      varying vec2      vTexCoord;
+
+                      // true mirror-repeat: 0..1 stays as is, 1..2 mirrors back
+                      vec2 mirrorUv(vec2 p) {
+                          return 1.0 - abs(mod(p, 2.0) - 1.0);
+                      }
+
+                      void main() {
+                          // cover-crop the image to the screen (no stretching) with a small zoom margin
+                          vec2 uv  = (vTexCoord - 0.5) * uUvScale + 0.5;
+                          vec2 off = uParallaxOffset * uParallaxStrength * 0.6;
+
+                          // depth: 1.0 = near, 0.0 = far (Depth Anything convention); bias 3.0 = blurred depth, no hard tearing
+                          float d1 = texture2D(uDepthTexture, mirrorUv(uv), 3.0).r;
+                          vec2  p1 = uv + off * (d1 - 0.5);
+                          // second lookup at the shifted position reduces tearing
+                          float d2 = texture2D(uDepthTexture, mirrorUv(p1), 3.0).r;
+                          vec2  p2 = uv + off * (d2 - 0.5);
+
+                          gl_FragColor = texture2D(uImageTexture, mirrorUv(p2));
+                      }
+                  """.trimIndent()'''
+          s = s[:start] + new_fs + s[end:]
+          open(p, "w").write(s)
+
+          patch(p, [
+              ("    private var uAspectRatio = 0\n",
+               "    private var uAspectRatio = 0\n    private var uUvScale = 0\n    private var imageAspect = 1f\n"),
+              ('        uParallaxStrength = GLES20.glGetUniformLocation(program, "uParallaxStrength")\n',
+               '        uParallaxStrength = GLES20.glGetUniformLocation(program, "uParallaxStrength")\n        uUvScale = GLES20.glGetUniformLocation(program, "uUvScale")\n'),
+              ("    fun uploadImage(bitmap: Bitmap) {\n",
+               "    fun uploadImage(bitmap: Bitmap) {\n        imageAspect = bitmap.width.toFloat() / bitmap.height.toFloat()\n"),
+              ("        GLES20.glUniform2f(uParallaxOffset, tiltX, tiltY)\n",
+               "        // gyro pitch (tiltX) moves vertically, roll (tiltY) moves horizontally\n"
+               "        GLES20.glUniform2f(uParallaxOffset, -tiltY, -tiltX)\n"
+               "        val screenAspect = surfaceWidth.toFloat() / surfaceHeight.toFloat()\n"
+               "        val sx = if (imageAspect > screenAspect) screenAspect / imageAspect else 1f\n"
+               "        val sy = if (imageAspect > screenAspect) 1f else imageAspect / screenAspect\n"
+               "        GLES20.glUniform2f(uUvScale, sx * 0.9f, sy * 0.9f)\n"),
+          ])
+
+          # ---------- DepthEstimator.kt ----------
+          patch(base + "depth/DepthEstimator.kt", [
+              ("            inputBuf[i]               = ((px shr 16) and 0xFF) / 255f  // R\n",
+               "            inputBuf[i]               = (((px shr 16) and 0xFF) / 255f - 0.485f) / 0.229f  // R\n"),
+              ("            inputBuf[planeSize + i]   = ((px shr  8) and 0xFF) / 255f  // G\n",
+               "            inputBuf[planeSize + i]   = (((px shr  8) and 0xFF) / 255f - 0.456f) / 0.224f  // G\n"),
+              ("            inputBuf[2 * planeSize + i] = (px and 0xFF)          / 255f  // B\n",
+               "            inputBuf[2 * planeSize + i] = ((px and 0xFF) / 255f - 0.406f) / 0.225f  // B\n"),
+          ])
+          print("PARALLAX PATCH OK")
+          EOF
+          python3 $HOME/patch_parallax.py
+
+      - name: Add crash logger
+        run: |
+          D=app/src/main/java/com/example/parallaxwallpaper
+          mkdir -p $D
+          cat > $D/CrashApp.kt << 'EOF'
+          package com.example.parallaxwallpaper
+
+          import android.app.Application
+          import android.content.ContentValues
+          import android.os.Build
+          import android.provider.MediaStore
+          import java.io.PrintWriter
+          import java.io.StringWriter
+
+          class CrashApp : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  val prev = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                      try {
+                          if (Build.VERSION.SDK_INT >= 29) {
+                              val sw = StringWriter()
+                              e.printStackTrace(PrintWriter(sw))
+                              val text = "Thread: " + t.name + "\n" + Build.MODEL + " API " + Build.VERSION.SDK_INT + "\n" + sw.toString()
+                              val v = ContentValues()
+                              v.put(MediaStore.Downloads.DISPLAY_NAME, "parallax_crash_" + System.currentTimeMillis() + ".txt")
+                              v.put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                              v.put(MediaStore.Downloads.RELATIVE_PATH, "Download")
+                              val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)
+                              if (uri != null) {
+                                  contentResolver.openOutputStream(uri)?.use { o -> o.write(text.toByteArray()) }
+                              }
+                          }
+                      } catch (x: Throwable) {
+                      }
+                      prev?.uncaughtException(t, e)
+                  }
+              }
+          }
+          EOF
+          python3 - << 'PY'
+          import re
+          p = "app/src/main/AndroidManifest.xml"
+          s = open(p).read()
+          m = re.search(r"<application[^>]*>", s, re.S)
+          tag = m.group(0)
+          if "android:name=" not in tag:
+              s = s.replace("<application", '<application android:name="com.example.parallaxwallpaper.CrashApp"', 1)
+              open(p, "w").write(s)
+              print("CrashApp registered")
+          else:
+              print("application already has a name:", tag)
+          PY
+
+      - name: Only arm64 init script
+        run: |
+          cat > $HOME/arm64.init.gradle << 'EOF'
+          allprojects { p ->
+              p.pluginManager.withPlugin("com.android.application") {
+                  p.extensions.getByName("android").defaultConfig.ndk.abiFilters.add("arm64-v8a")
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: |
+          for i in 1 2 3; do
+            gradle assembleDebug --no-daemon -I $HOME/arm64.init.gradle && exit 0
+            echo "Attempt $i failed, retrying..."
+            sleep 20
+          done
+          exit 1
+
+      - name: Find APK
+        run: find . -name "*.apk" -o -name "*.aab" | head -20 | xargs -r ls -lh
+
       - uses: actions/upload-artifact@v4
         with:
-          name: DepthWall-debug
-          path: DepthWall/app/build/outputs/apk/debug/*.apk
+          name: ParallaxWallpaper-apk
+          path: "**/build/**/*.apk"
+          if-no-files-found: error
